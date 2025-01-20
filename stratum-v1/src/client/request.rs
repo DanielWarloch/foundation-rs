@@ -387,4 +387,24 @@ mod tests {
         assert_eq!(len.unwrap(), 97);
         assert_eq!(&buf[..97], br#"{"id":1,"method":"mining.submit","params":["slush.miner1","bf","00000001","504e86ed","b2957c02"]}"#);
     }
+    #[test]
+    fn test_submit_version_rolling() {
+        let mut buf = [0u8; 1024];
+        let share = Share {
+            job_id: "bf".try_into().unwrap(),
+            extranonce2: hvec!(u8, 8, &[0, 0, 0, 1]),
+            ntime: 1347323629,
+            nonce: 0x0603_db8b,
+            version_bits: Some(0x7da0000),
+        };
+        let len = super::submit(
+            1,
+            "slush.miner1".try_into().unwrap(),
+            share,
+            buf.as_mut_slice(),
+        );
+        assert!(len.is_ok());
+        assert_eq!(len.unwrap(), 97);
+        assert_eq!(&buf[..97], br#"{"id":1,"method":"mining.submit","params":["slush.miner1","bf","00000001","504e86ed","b2957c02"]}"#);
+    }
 }

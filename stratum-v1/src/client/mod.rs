@@ -7,6 +7,7 @@ mod request;
 mod response;
 
 use crate::{Error, Result};
+pub use job::Header;
 pub use job::Job;
 use job::JobCreator;
 use notification::Notification;
@@ -106,7 +107,10 @@ impl<C: Read + ReadReady + Write, const RX_BUF_SIZE: usize, const TX_BUF_SIZE: u
                 "Received Message [{}..{}], free pos: {}",
                 start, stop, self.rx_free_pos
             );
-            trace!("{:?}", line);
+            info!(
+                "Recived message from stratum: {:?}",
+                core::str::from_utf8(line)
+            );
             trace!("Self.reqs: {:?}", self.reqs);
             if let Some(id) = response::parse_id(line)? {
                 // it's a Response
@@ -236,7 +240,10 @@ impl<C: Read + ReadReady + Write, const RX_BUF_SIZE: usize, const TX_BUF_SIZE: u
 
     async fn send_req(&mut self, req_len: usize) -> Result<()> {
         self.tx_buf[req_len] = 0x0a;
-        trace!("{:?}", &self.tx_buf[..req_len + 1]);
+        info!(
+            "Connection write req as str: {:?}",
+            core::str::from_utf8(&self.tx_buf[..req_len + 1])
+        );
         self.network_conn
             .write_all(&self.tx_buf[..req_len + 1])
             .await
