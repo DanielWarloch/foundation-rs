@@ -9,13 +9,101 @@ use faster_hex::hex_decode;
 use heapless::{String, Vec};
 use serde::{Deserialize, Deserializer};
 
+/// Normalize JSON by converting string ids to numeric ids in-place.
+/// This handles pools that send `"id":"24"` instead of `"id":24`.
+/// Returns the length of the normalized JSON.
+fn normalize_string_id(input: &[u8], output: &mut [u8]) -> usize {
+    // Look for "id":" pattern and remove the quotes around the numeric value
+    let mut i = 0;
+    let mut o = 0;
+
+    while i < input.len() && o < output.len() {
+        // Check for "id":" pattern (with optional whitespace)
+        if i + 5 < input.len() && &input[i..i + 4] == b"\"id\"" {
+            // Copy "id"
+            output[o..o + 4].copy_from_slice(&input[i..i + 4]);
+            i += 4;
+            o += 4;
+
+            // Skip whitespace
+            while i < input.len() && (input[i] == b' ' || input[i] == b'\t') {
+                output[o] = input[i];
+                i += 1;
+                o += 1;
+            }
+
+            // Check for colon
+            if i < input.len() && input[i] == b':' {
+                output[o] = input[i];
+                i += 1;
+                o += 1;
+
+                // Skip whitespace
+                while i < input.len() && (input[i] == b' ' || input[i] == b'\t') {
+                    output[o] = input[i];
+                    i += 1;
+                    o += 1;
+                }
+
+                // Check if the value is a quoted string that looks like a number
+                if i < input.len() && input[i] == b'"' {
+                    // Find the closing quote
+                    let start = i + 1;
+                    let mut end = start;
+                    while end < input.len() && input[end] != b'"' {
+                        end += 1;
+                    }
+
+                    if end < input.len() {
+                        // Check if the content is a valid number (all digits)
+                        let content = &input[start..end];
+                        let is_numeric =
+                            !content.is_empty() && content.iter().all(|&c| c.is_ascii_digit());
+
+                        if is_numeric {
+                            // Copy the number without quotes
+                            let len = end - start;
+                            if o + len <= output.len() {
+                                output[o..o + len].copy_from_slice(content);
+                                o += len;
+                                i = end + 1; // Skip past closing quote
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Default: copy byte as-is
+        if o < output.len() {
+            output[o] = input[i];
+            o += 1;
+        }
+        i += 1;
+    }
+
+    o
+}
+
 pub(crate) fn parse_id(resp: &[u8]) -> Result<Option<u64>> {
     #[derive(Debug, Deserialize)]
     #[cfg_attr(feature = "defmt-03", derive(defmt::Format))]
     struct IdOnly {
         id: Option<u64>,
     }
-    let id = serde_json_core::from_slice::<IdOnly>(resp)?.0.id;
+
+    // Try parsing directly first (common case: numeric id)
+    if let Ok((id_only, _)) = serde_json_core::from_slice::<IdOnly>(resp) {
+        return Ok(id_only.id);
+    }
+
+    // If that fails, try normalizing string id to numeric
+    let mut normalized = [0u8; 256];
+    let len = normalize_string_id(resp, &mut normalized);
+    let id = serde_json_core::from_slice::<IdOnly>(&normalized[..len])?
+        .0
+        .id;
     match id {
         None => Ok(None),
         Some(id) => Ok(Some(id)),
@@ -74,6 +162,8 @@ impl<'de, R: Deserialize<'de>> Deserialize<'de> for Response<R> {
             Result,
             Error,
             Id,
+            RejectReason,
+            Unknown,
         }
 
         struct KeyVisitor;
@@ -83,7 +173,7 @@ impl<'de, R: Deserialize<'de>> Deserialize<'de> for Response<R> {
 
             #[inline]
             fn expecting(&self, formatter: &mut core::fmt::Formatter) -> core::fmt::Result {
-                formatter.write_str("Key must be a string and one of the following values: ['result', 'error', 'id']")
+                formatter.write_str("Key must be a string and one of the following values: ['result', 'error', 'id', 'reject-reason']")
             }
 
             #[inline]
@@ -97,11 +187,10 @@ impl<'de, R: Deserialize<'de>> Deserialize<'de> for Response<R> {
                     Ok(Key::Error)
                 } else if text.eq_ignore_ascii_case("id") {
                     Ok(Key::Id)
+                } else if text.eq_ignore_ascii_case("reject-reason") {
+                    Ok(Key::RejectReason)
                 } else {
-                    Err(serde::de::Error::invalid_value(
-                        serde::de::Unexpected::Str(text),
-                        &self,
-                    ))
+                    Ok(Key::Unknown)
                 }
             }
         }
@@ -129,6 +218,7 @@ impl<'de, R: Deserialize<'de>> Deserialize<'de> for Response<R> {
                 //safety of field-by-field initialization
                 let mut result = None;
                 let mut id = None;
+                let mut reject_reason: Option<tstring!(32)> = None;
 
                 while let Some(key) = map.next_key::<Key>()? {
                     match key {
@@ -163,20 +253,39 @@ impl<'de, R: Deserialize<'de>> Deserialize<'de> for Response<R> {
                         Key::Id => {
                             id = map.next_value::<Option<u64>>()?;
                         }
+                        Key::RejectReason => {
+                            reject_reason = map.next_value::<Option<tstring!(32)>>()?;
+                        }
+                        Key::Unknown => {
+                            // Skip other unknown fields
+                            map.next_value::<serde::de::IgnoredAny>()?;
+                        }
                     }
                 }
 
-                Ok(Self::Value {
-                    payload: match result {
-                        Some(payload) => payload.map_err(|e| e.into()),
-                        None => {
-                            return Err(serde::de::Error::custom(
-                                "JSON-RPC Response is missing either result or error field.",
-                            ));
+                // If we have a reject-reason and no explicit error, convert reject-reason to error
+                let payload = match result {
+                    Some(Err(e)) => Err(e.into()),
+                    Some(Ok(value)) => {
+                        // Check if reject-reason should override a false result
+                        if let Some(reason) = reject_reason {
+                            Err(Error::Pool {
+                                code: 0,
+                                message: reason,
+                                detail: None,
+                            })
+                        } else {
+                            Ok(value)
                         }
-                    },
-                    id,
-                })
+                    }
+                    None => {
+                        return Err(serde::de::Error::custom(
+                            "JSON-RPC Response is missing either result or error field.",
+                        ));
+                    }
+                };
+
+                Ok(Self::Value { payload, id })
             }
         }
 
@@ -276,7 +385,10 @@ pub(crate) fn parse_configure(resp: &[u8]) -> Result<Extensions> {
         }
     }
 
-    serde_json_core::from_slice::<Response<ConfigureRespRaw>>(resp)?
+    // Normalize string ids to numeric ids before parsing
+    let mut normalized = [0u8; 512];
+    let len = normalize_string_id(resp, &mut normalized);
+    serde_json_core::from_slice::<Response<ConfigureRespRaw>>(&normalized[..len])?
         .0
         .payload
         .map_err(|_| Error::RpcOther)?
@@ -334,20 +446,29 @@ pub(crate) fn parse_connect(resp: &[u8]) -> Result<ConnectResp> {
         }
     }
 
-    serde_json_core::from_slice::<Response<ConnectRespRaw>>(resp)?
+    // Normalize string ids to numeric ids before parsing
+    let mut normalized = [0u8; 512];
+    let len = normalize_string_id(resp, &mut normalized);
+    serde_json_core::from_slice::<Response<ConnectRespRaw>>(&normalized[..len])?
         .0
         .payload?
         .try_into()
 }
 
 pub(crate) fn parse_authorize(resp: &[u8]) -> Result<bool> {
-    serde_json_core::from_slice::<Response<bool>>(resp)?
+    // Normalize string ids to numeric ids before parsing
+    let mut normalized = [0u8; 256];
+    let len = normalize_string_id(resp, &mut normalized);
+    serde_json_core::from_slice::<Response<bool>>(&normalized[..len])?
         .0
         .payload
 }
 
 pub(crate) fn parse_submit(resp: &[u8]) -> Result<bool> {
-    serde_json_core::from_slice::<Response<bool>>(resp)?
+    // Normalize string ids to numeric ids before parsing
+    let mut normalized = [0u8; 256];
+    let len = normalize_string_id(resp, &mut normalized);
+    serde_json_core::from_slice::<Response<bool>>(&normalized[..len])?
         .0
         .payload
 }
@@ -373,6 +494,12 @@ mod tests {
         let resp = br#"{ "id": null, "method": "mining.set_difficulty", "params": [2]}"#;
         assert_eq!(parse_id(resp), Ok(None));
 
+        // id as string (numeric)
+        let resp = br#"{"id": "24", "result": true, "error": null}"#;
+        assert_eq!(parse_id(resp), Ok(Some(24)));
+
+        // id as string (non-numeric) - normalize_string_id won't convert it,
+        // so it will remain as a string and cause InvalidType error
         let resp = br#"{ "id": "ab", "method": "mining.set_difficulty", "params": [2]}"#;
         assert_eq!(
             parse_id(resp),
@@ -642,5 +769,23 @@ mod tests {
                 detail: None
             })
         );
+        // Some pools include extra fields like "reject-reason" - should be parsed as error
+        let resp = br#"{"reject-reason":"Stale","result":false,"error":null,"id":25}"#;
+        assert_eq!(
+            parse_submit(resp),
+            Err(Error::Pool {
+                code: 0,
+                message: hstring!(32, "Stale"),
+                detail: None
+            })
+        );
+
+        // id as string
+        let resp = br#"{"result":true,"error":null,"id":"24"}"#;
+        assert_eq!(parse_submit(resp), Ok(true));
+
+        // id as number (standard case)
+        let resp = br#"{"result":true,"error":null,"id":24}"#;
+        assert_eq!(parse_submit(resp), Ok(true));
     }
 }
