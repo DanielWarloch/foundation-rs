@@ -74,6 +74,7 @@ impl<'de, R: Deserialize<'de>> Deserialize<'de> for Response<R> {
             Result,
             Error,
             Id,
+            Unknown,
         }
 
         struct KeyVisitor;
@@ -98,10 +99,7 @@ impl<'de, R: Deserialize<'de>> Deserialize<'de> for Response<R> {
                 } else if text.eq_ignore_ascii_case("id") {
                     Ok(Key::Id)
                 } else {
-                    Err(serde::de::Error::invalid_value(
-                        serde::de::Unexpected::Str(text),
-                        &self,
-                    ))
+                    Ok(Key::Unknown)
                 }
             }
         }
@@ -162,6 +160,10 @@ impl<'de, R: Deserialize<'de>> Deserialize<'de> for Response<R> {
                         },
                         Key::Id => {
                             id = map.next_value::<Option<u64>>()?;
+                        }
+                        Key::Unknown => {
+                            // Skip unknown fields (e.g., "reject-reason" from some pools)
+                            map.next_value::<serde::de::IgnoredAny>()?;
                         }
                     }
                 }
@@ -642,5 +644,8 @@ mod tests {
                 detail: None
             })
         );
+        // Some pools include extra fields like "reject-reason"
+        let resp = br#"{"reject-reason":"Stale","result":false,"error":null,"id":25}"#;
+        assert_eq!(parse_submit(resp), Ok(false));
     }
 }
