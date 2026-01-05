@@ -4,6 +4,8 @@
 use crate::{Error, Extensions, Info, Result, VersionRolling};
 #[cfg(feature = "alloc")]
 use alloc::{string::String, vec::Vec};
+#[cfg(not(feature = "alloc"))]
+use core::str::FromStr;
 use faster_hex::hex_decode;
 #[cfg(not(feature = "alloc"))]
 use heapless::{String, Vec};
@@ -74,6 +76,7 @@ impl<'de, R: Deserialize<'de>> Deserialize<'de> for Response<R> {
             Result,
             Error,
             Id,
+            RejectReason,
         }
 
         struct KeyVisitor;
@@ -97,6 +100,8 @@ impl<'de, R: Deserialize<'de>> Deserialize<'de> for Response<R> {
                     Ok(Key::Error)
                 } else if text.eq_ignore_ascii_case("id") {
                     Ok(Key::Id)
+                } else if text.eq_ignore_ascii_case("reject-reason") {
+                    Ok(Key::RejectReason)
                 } else {
                     Err(serde::de::Error::invalid_value(
                         serde::de::Unexpected::Str(text),
@@ -163,6 +168,19 @@ impl<'de, R: Deserialize<'de>> Deserialize<'de> for Response<R> {
                         Key::Id => {
                             id = map.next_value::<Option<u64>>()?;
                         }
+                        Key::RejectReason => match map.next_value::<Option<tstring!(32)>>()? {
+                            Some(value) => {
+                                // Error has priority over Result, if both exist Result is ignored
+                                if result.is_none() {
+                                    result = Some(Err(RespErr(
+                                        -1,
+                                        hstring!(32, "Rejected by server"),
+                                        Some(value),
+                                    )));
+                                }
+                            }
+                            None => continue,
+                        },
                     }
                 }
 
@@ -640,6 +658,16 @@ mod tests {
                 code: 39,
                 message: hstring!(32, "SStaleJobNoSub"),
                 detail: None
+            })
+        );
+        // CK Pool
+        let resp = br#"{"reject-reason":"Stale","result":false,"error":null,"id":25}"#;
+        assert_eq!(
+            parse_submit(resp),
+            Err(Error::Pool {
+                code: -1,
+                message: hstring!(32, "Rejected by server"),
+                detail: Some(hstring!(32, "Stale"))
             })
         );
     }
