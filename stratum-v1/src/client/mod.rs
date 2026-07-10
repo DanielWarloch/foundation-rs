@@ -245,7 +245,16 @@ impl<C: Read + ReadReady + Write, const RX_BUF_SIZE: usize, const TX_BUF_SIZE: u
         } else if start == self.rx_free_pos {
             self.rx_free_pos = 0;
         }
-        if self.network_conn.read_ready().map_err(|_| Error::Network)? {
+        // Only pull more bytes off the socket when we have no message to return
+        // yet. Reading unconditionally means that after parsing a message we
+        // fall into `read().await`, which stays Pending whenever the peer has
+        // gone quiet (e.g. right after `mining.configure`, before we've sent
+        // `mining.subscribe`). Because callers hold this client behind a mutex
+        // across `poll_message()`, that Pending read never yields the parsed
+        // message and deadlocks the whole session. Returning the message first
+        // lets the caller act on it (send subscribe/authorize); the next call,
+        // with an empty parse result, does the read.
+        if msg.is_none() && self.network_conn.read_ready().map_err(|_| Error::Network)? {
             let n = self
                 .network_conn
                 .read(self.rx_buf[self.rx_free_pos..].as_mut())
